@@ -47,22 +47,35 @@ class Dataset:
 
         self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
         self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+        
+        if not os.path.exists(os.path.join(self.data_dir, self.render_cameras_name)):
+            self.render_cameras_name = "proj_mtx_all.npy"
+            self.object_cameras_name = "proj_mtx_all.npy"
 
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
         self.n_images = len(self.images_lis)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
+        
+        if not os.path.exists(os.path.join(self.data_dir, 'mask')):
+            os.makedirs(os.path.join(self.data_dir, 'mask'), exist_ok=True)
+            images_np = np.stack([cv.imread(im_name, cv.IMREAD_UNCHANGED) for im_name in self.images_lis])
+            for idx, img_file in enumerate(self.images_lis):
+                cv.imwrite(img_file.replace("/image/", "/mask/"), images_np[idx, :, :, -1])
+         
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        self.masks_np = np.stack([((cv.imread(im_name)>0)*255).astype(np.uint8) for im_name in self.masks_lis]) / 256.0
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        if self.render_cameras_name == "proj_mtx_all.npy":
+            self.world_mats_np = [camera_dict[idx].astype(np.float32) for idx in range(self.n_images)]
+            self.scale_mats_np = [np.eye(4).astype(np.float32) for _ in range(self.n_images)]
+        else:
+            # world_mat is a projection matrix from world to image
+            self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
-        self.scale_mats_np = []
-
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+            # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
+            self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -74,8 +87,8 @@ class Dataset:
             self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device) # [n_images, H, W, 3]
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
         self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
@@ -86,7 +99,10 @@ class Dataset:
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
         # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
+        if self.object_cameras_name == "proj_mtx_all.npy":
+            object_scale_mat = np.eye(4)
+        else:
+            object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
@@ -122,7 +138,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1).to(self.device)    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
